@@ -24,6 +24,10 @@ type Config struct {
 	// stack to set transport handlers.
 	TransportHandler adapter.TransportHandler
 
+	// ICMPHandler is the optional handler used to process
+	// ICMPv4/ICMPv6 packets.
+	ICMPHandler adapter.ICMPHandler
+
 	// MulticastGroups is used by internal stack to add
 	// nic to given groups.
 	MulticastGroups []netip.Addr
@@ -63,6 +67,8 @@ func CreateStack(cfg *Config) (*stack.Stack, error) {
 		// Initiate transport protocol (TCP/UDP) with given handler.
 		withTCPHandler(cfg.TransportHandler.HandleTCP),
 		withUDPHandler(cfg.TransportHandler.HandleUDP),
+		// Initiate ICMP handler if provided.
+		withICMPHandler(cfg.ICMPHandler),
 
 		// Create stack NIC and then bind link endpoint to it.
 		withCreatingNIC(nicID, cfg.LinkEndpoint),
@@ -97,6 +103,12 @@ func CreateStack(cfg *Config) (*stack.Stack, error) {
 		// Add default NIC to the given multicast groups.
 		withMulticastGroups(nicID, cfg.MulticastGroups),
 	)
+	// TODO: 后续研究是否需要这个
+	// If a custom ICMP handler is provided, disable default ICMP generation
+	// in the stack to avoid conflicts (e.g., auto Echo Reply).
+	// if cfg.ICMPHandler != nil {
+	//     opts = append(opts, option.WithICMPLimit(0), option.WithICMPBurst(0))
+	// }
 
 	for _, opt := range opts {
 		if err := opt(s); err != nil {
