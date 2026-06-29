@@ -23,6 +23,7 @@ func withICMPHandler(h adapter.NetworkHandler) option.Option {
 			return false
 		})
 		s.SetTransportProtocolHandler(icmp.ProtocolNumber4, f.HandlePacket)
+		s.SetTransportProtocolHandler(icmp.ProtocolNumber6, f.HandlePacket)
 		return nil
 	}
 }
@@ -104,8 +105,65 @@ func (f *icmpForwarder) handlePacket4(_ stack.TransportEndpointID, pkt *stack.Pa
 	return true
 }
 
-func (f *icmpForwarder) handlePacket6(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-	return false // not implemented
+// Ref: https://github.com/google/gvisor/blob/c58cb637/pkg/tcpip/network/ipv6/icmp.go#L655-L706
+func (f *icmpForwarder) handlePacket6(_ stack.TransportEndpointID, pkt *stack.PacketBuffer) (handled bool) {
+	h := header.ICMPv6(pkt.TransportHeader().Slice())
+	if len(h) < header.ICMPv6EchoMinimumSize || h.Type() != header.ICMPv6EchoRequest {
+		return false
+	}
+
+	ipHdr := header.IPv6(pkt.NetworkHeader().Slice())
+
+	// As per RFC 4291 section 2.7, multicast addresses must not be used as
+	// source addresses in IPv6 packets.
+	localAddr := ipHdr.DestinationAddress()
+	if header.IsV6MulticastAddress(localAddr) {
+		localAddr = tcpip.Address{}
+	}
+
+	r, err := f.s.FindRoute(pkt.NICID, localAddr, ipHdr.SourceAddress(), ipv6.ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		// If we cannot find a route to the destination, silently drop the packet.
+		return false
+	}
+	defer r.Release()
+
+	replyPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: int(r.MaxHeaderLength()) + header.ICMPv6EchoMinimumSize,
+		Payload:            pkt.Data().ToBuffer(),
+	})
+	defer replyPkt.DecRef()
+
+	replyICMPHdr := header.ICMPv6(replyPkt.TransportHeader().Push(header.ICMPv6EchoMinimumSize))
+	replyPkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
+	copy(replyICMPHdr, h)
+	replyICMPHdr.SetType(header.ICMPv6EchoReply)
+
+	replyData := replyPkt.Data()
+	replyICMPHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header:      replyICMPHdr,
+		Src:         r.LocalAddress(),
+		Dst:         r.RemoteAddress(),
+		PayloadCsum: replyData.Checksum(),
+		PayloadLen:  replyData.Size(),
+	}))
+
+	// Even though RFC 4443 does not mention anything about it, Linux uses the
+	// TrafficClass of the received echo request when replying.
+	// https://github.com/torvalds/linux/blob/0280e3c58f9/net/ipv6/icmp.c#L797
+	replyTClass, _ := ipHdr.TOS()
+
+	sent := f.s.Stats().ICMP.V6.PacketsSent
+	if err := r.WritePacket(stack.NetworkHeaderParams{
+		Protocol: header.ICMPv6ProtocolNumber,
+		TTL:      r.DefaultTTL(),
+		TOS:      replyTClass,
+	}, replyPkt); err != nil {
+		sent.Dropped.Increment()
+		return false
+	}
+	sent.EchoReply.Increment()
+	return true
 }
 
 type icmpForwarderRequest struct {
